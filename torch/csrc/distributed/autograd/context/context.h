@@ -1,11 +1,13 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
+
 #include <ATen/core/Dict.h>
 #include <torch/csrc/autograd/engine.h>
 #include <torch/csrc/distributed/autograd/functions/recvrpc_backward.h>
 #include <torch/csrc/distributed/autograd/functions/sendrpc_backward.h>
 #include <torch/csrc/distributed/rpc/rpc_agent.h>
-#include <cstdint>
 
 namespace torch {
 namespace distributed {
@@ -17,6 +19,8 @@ class RecvRpcBackward;
 // autograd pass on a worker.
 class TORCH_API DistAutogradContext {
  public:
+  using GradCallback = std::function<void(torch::Tensor&)>;
+
   explicit DistAutogradContext(int64_t contextId);
 
   // Retrieves the autograd context id for this context.
@@ -52,6 +56,10 @@ class TORCH_API DistAutogradContext {
 
   // Returns all gradients.
   const c10::Dict<torch::Tensor, torch::Tensor> getGradients() const;
+
+  void runGradCallbaclForVariable(
+      const torch::autograd::Variable& variable,
+      GradCallback&& cb);
 
   DistAutogradContext(const DistAutogradContext&) = delete;
   DistAutogradContext& operator=(const DistAutogradContext&) = delete;
