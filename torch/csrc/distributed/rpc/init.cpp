@@ -16,6 +16,7 @@
 #include <torch/types.h>
 
 #include <pybind11/chrono.h>
+#include <pybind11/functional.h>
 #include <pybind11/operators.h>
 
 namespace torch {
@@ -23,6 +24,18 @@ namespace distributed {
 namespace rpc {
 
 namespace {
+
+// Wrap Python function to guard deref
+struct PythonFunction {
+  explicit PythonFunction(py::function func) : func_(std::move(func)) {}
+
+  ~PythonFunction() {
+    pybind11::gil_scoped_acquire ag;
+    func_ = py::none();
+  }
+
+  py::function func_;
+};
 
 constexpr std::chrono::milliseconds kDeleteAllUsersTimeout(100000);
 constexpr float kSecToMsConversion = 1000;
@@ -333,23 +346,71 @@ PyObject* rpc_init(PyObject* /* unused */) {
   // pythonRpcHandler is cleaned up in shutdown(), after
   // shutdown(), python objects returned from rpc python call can not be
   // resolved.
-  auto future = shared_ptr_class_<FutureIValue>(module, "Future")
-                    .def(
-                        "wait",
-                        [&](FutureIValue& fut) {
-                          auto& pythonRpcHandler =
-                              PythonRpcHandler::getInstance();
-                          const auto& value = fut.wait();
-                          pybind11::gil_scoped_acquire ag;
-                          auto obj = torch::jit::toPyObject(value);
-                          pythonRpcHandler.handleException(obj);
-                          return obj;
-                        },
-                        py::call_guard<py::gil_scoped_release>(),
-                        R"(
+  shared_ptr_class_<FutureIValue>(module, "Future")
+      .def(
+          "wait",
+          [&](FutureIValue& fut) {
+            auto& pythonRpcHandler = PythonRpcHandler::getInstance();
+            const auto& value = fut.wait();
+            pybind11::gil_scoped_acquire ag;
+            auto obj = torch::jit::toPyObject(value);
+            pythonRpcHandler.handleException(obj);
+            return obj;
+          },
+          py::call_guard<py::gil_scoped_release>(),
+          R"(
 Wait on future to complete and return the object it completed with.
 If the future completes with an error, an exception is thrown.
-              )");
+          )")
+      .def(
+          "_then",
+          [&](FutureIValue& fut, py::function cb) {
+            // We need this an additional layer of wrapper here to guard the
+            // destruction of the py::function object. Because, the
+            // FutureIValue owns a reference to the py::function in its
+            // callback vector, but FutureIValue does not acquire GIL on
+            // destruction and it does not need to do so either. FutureIValue
+            // only acquires GIL if the IValue holds a py::object. However,
+            // nothing prevents applications to insert py::function as callbacks
+            // non-py::object FutureIValue. For example, the application can
+            // call a TorchScript function using rpc_async, and then append
+            // py::function as a callback. Hence, we use PythonFunction wrapper
+            // here to explicitly acquire GIL and decouple value destruction and
+            // callback destruction.
+            PythonFunction pf(std::move(cb));
+            return fut.then<IValue>([pf](const FutureIValue& fut) -> IValue {
+              if (fut.hasError()) {
+                throw std::runtime_error(c10::str(
+                    "Parent Future reported error: ",
+                    (*fut.error()).what()));
+              } else {
+                try {
+                  pybind11::gil_scoped_acquire ag;
+                  py::object ret =
+                      pf.func_(torch::jit::toPyObject(fut.constValue()));
+                  return jit::toIValue(std::move(ret), PyObjectType::get());
+                } catch (py::error_already_set& e) {
+                  auto err = std::runtime_error(c10::str(
+                      "Got the following error when running the callback: ",
+                      e.what()));
+                  {
+                    pybind11::gil_scoped_acquire ag;
+                    // Release ownership on py::objects and also restore Python
+                    // Error Indicator.
+                    e.restore();
+                    // Clear the Python Error Indicator as we has recorded the
+                    // exception in the response message.
+                    PyErr_Clear();
+                  }
+
+                  throw err;
+                } catch (...) {
+                  throw std::runtime_error("Unknown error when running callback");
+                }
+              }
+            });
+          },
+          py::call_guard<py::gil_scoped_release>());
 
   shared_ptr_class_<ProcessGroupRpcBackendOptions>(
       module,

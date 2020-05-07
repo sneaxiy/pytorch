@@ -3,6 +3,7 @@ import sys
 import time
 import unittest
 from collections import namedtuple
+from functools import partial
 from unittest import mock
 
 import torch
@@ -296,6 +297,17 @@ def check_rref_confirmed(rref):
 
 def get_rref_debug_info():
     return _rref_context_get_debug_info()
+
+
+def add_use_future_cb(to, x, y, z):
+    out = concurrent.futures.Future()
+
+    def callback(ret):
+        out.set_result(ret + z)
+
+    fut = rpc.rpc_async(to, torch.add, args=(x, y))
+    fut._then(callback)
+    return out.result()
 
 
 # load_tests from common_utils is used to automatically filter tests for
@@ -2354,6 +2366,122 @@ class RpcTest(RpcAgentTestFixture):
             # Verify the returned tensor.
             self.assertEqual(t_view, t_ret)
             self.assertFalse(t_ret.is_contiguous())
+
+    @dist_init
+    def test_callback(self):
+        set_by_cb = concurrent.futures.Future()
+        n = self.rank + 1
+
+        def callback(ret):
+            self.assertEqual(ret, torch.ones(n, n) * 2)
+            set_by_cb.set_result(ret.clone() + 1)
+
+        fut = rpc.rpc_async(
+            worker_name(n % self.world_size),
+            torch.add,
+            args=(torch.ones(n, n), torch.ones(n, n))
+        )
+
+        fut._then(callback)
+
+        self.assertEqual(fut.wait(), torch.ones(n, n) * 2)
+        self.assertEqual(set_by_cb.result(), torch.ones(n, n) * 2 + 1)
+        self.assertEqual(fut.wait(), torch.ones(n, n) * 2)
+
+    @dist_init
+    def test_callback_wrong_args(self):
+        set_by_cb = concurrent.futures.Future()
+        n = self.rank + 1
+
+        fut = rpc.rpc_async(
+            worker_name(n % self.world_size),
+            torch.add,
+            args=(torch.ones(n, n), torch.ones(n, n))
+        )
+
+        cb_fut = fut._then(my_function)
+
+        self.assertEqual(fut.wait(), torch.ones(n, n) * 2)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "my\\_function\\(\\) missing 2 required positional arguments"
+        ):
+            cb_fut.wait()
+
+    @dist_init
+    def test_callback_multi(self):
+        num_cbs = 10
+        set_by_cbs = [concurrent.futures.Future() for _ in range(num_cbs)]
+        n = self.rank + 1
+
+        def callback(idx, ret):
+            self.assertEqual(ret, torch.ones(n, n) * 2)
+            set_by_cbs[idx].set_result(ret.clone() + idx)
+
+        fut = rpc.rpc_async(
+            worker_name(n % self.world_size),
+            torch.add,
+            args=(torch.ones(n, n), torch.ones(n, n))
+        )
+
+        for idx in range(num_cbs):
+            fut._then(partial(callback, idx))
+
+        self.assertEqual(fut.wait(), torch.ones(n, n) * 2)
+
+        for idx in range(num_cbs):
+            self.assertEqual(
+                set_by_cbs[idx].result(),
+                torch.ones(n, n) * 2 + idx
+            )
+
+        self.assertEqual(fut.wait(), torch.ones(n, n) * 2)
+
+    @dist_init
+    def test_callback_in_rpc(self):
+        dst1 = worker_name((self.rank + 1) % self.world_size)
+        dst2 = worker_name((self.rank + 2) % self.world_size)
+
+        ret = rpc.rpc_sync(
+            dst1,
+            add_use_future_cb,
+            args=(dst2, torch.ones(2, 2), 1, 2)
+        )
+        self.assertEqual(ret, torch.ones(2, 2) + 1 + 2)
+
+    @dist_init
+    def test_callback_with_ret(self):
+        dst = worker_name((self.rank + 1) % self.world_size)
+
+        def callback(ret):
+            fut = rpc.rpc_async(
+                dst,
+                torch.add,
+                args=(ret, 1)
+            )._then(lambda x: x + 1)
+
+            return fut.wait()
+
+        fut = rpc.rpc_async(
+            dst,
+            torch.add,
+            args=(torch.ones(2, 2), 1)
+        )._then(callback)
+
+        self.assertEqual(fut.wait(), torch.ones(2, 2) + 3)
+
+    @dist_init
+    def test_callback_torchscript(self):
+        dst = worker_name((self.rank + 1) % self.world_size)
+
+        fut = rpc.rpc_async(
+            dst,
+            torch.add,
+            args=(torch.ones(2, 2), 1)
+        )._then(my_script_func)
+
+        self.assertEqual(fut.wait(), (torch.ones(2, 2) + 1) * 2)
 
 
 class FaultyAgentRpcTest(FaultyRpcAgentTestFixture):
